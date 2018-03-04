@@ -5,7 +5,8 @@
             [ring.util.response :as ring-resp]
             [clojure.walk :as walk]
             [pedestal_play.deque :as dq]
-            [clojure.string :as clj-str]))
+            [clojure.string :as clj-str]
+            [clojure.data.json :as json]))
 
 (def agents (atom {}))
 (def available-jobs (ref dq/empty-deque))
@@ -40,8 +41,13 @@
 
 (defn get-agent-stats
   [request]
-  (let [agent-id (get-in request [:path-params :agent-id])]
-    (http/json-response (get-agent-jobs-performed ((keyword agent-id) @agents)))))
+  (let [agent-id (get-in request [:path-params :agent-id])
+        ag ((keyword agent-id) @agents)]
+    (if ag
+      (http/json-response (get-agent-jobs-performed ((keyword agent-id) @agents)))
+      (-> (ring-resp/response (json/write-str {:msg "agent not found"}))
+          (ring-resp/content-type "application/json")
+          (ring-resp/status 404)))))
 
 (defn create-jobs-performed-att
   [primary secondary]
@@ -83,12 +89,12 @@
   [request]
   (if (is-agent-request-body-ok? (:json-params request))
     (if (agent-exists? (:id (:json-params request)) @agents)
-      (-> (ring-resp/response "")
+      (-> (ring-resp/response (json/write-str {:msg "agent already exists"}))
           (ring-resp/content-type "application/json")
           (ring-resp/status 409))
       (let [saved-agent (save-agent (:json-params request))]
-      (ring-resp/created (str "http://localhost:8080/agent/" (:id (:json-params request))) saved-agent)))
-    (-> (ring-resp/response "")
+        (ring-resp/created (str "http://localhost:8080/agent/" (:id (:json-params request))) saved-agent)))
+    (-> (ring-resp/response (json/write-str {:msg "malformed request body"}))
         (ring-resp/content-type "application/json")
         (ring-resp/status 403))))
 
@@ -121,12 +127,12 @@
   [request]
   (if (is-job-request-body-ok? (:json-params request))
     (if (job-exists? (:id (:json-params request)) (dq/get-seq @available-jobs) @assigned-jobs @completed-jobs)
-      (-> (ring-resp/response "")
+      (-> (ring-resp/response (json/write-str {:msg "job already exists"}))
           (ring-resp/content-type "application/json")
           (ring-resp/status 409))
       (let [saved-job (save-job available-jobs (:json-params request))]
         (ring-resp/created (str "http://localhost:8080/job/" (:id (:json-params request))) saved-job)))
-    (-> (ring-resp/response "")
+    (-> (ring-resp/response (json/write-str {:msg "malformed request body"}))
         (ring-resp/content-type "application/json")
         (ring-resp/status 403))))
 
@@ -149,11 +155,11 @@
   (first (filter #(contains-type? (skillset ag) (:type %)) jobs)))
 
 (defn create-assignment
-  [job ag]
-  (assoc {} :job_id (:id job) :job_type (:type job) :agent_id (:id ag)))
+  [job ag-id]
+  (assoc {} :job_id (:id job) :job_type (:type job) :agent_id ag-id))
 
 (defn assign-job
-  [from-job-queue to-job-queue job ag]
+  [from-job-queue to-job-queue job ag-id]
   (dosync
     (if (:urgent job)
       (do
@@ -161,7 +167,7 @@
                                   (assoc curr :head
                                      (vec
                                        (remove #(= (:id %) (:id to-be-removed)) (:head curr))))) job)
-        (let [assignment (create-assignment job ag)]
+        (let [assignment (create-assignment job ag-id)]
           (alter to-job-queue conj assignment)
             assignment))
       (do
@@ -169,18 +175,18 @@
                                   (assoc curr :tail
                                     (vec
                                       (remove #(= (:id %) (:id to-be-removed)) (:tail curr))))) job)
-        (let [assignment (create-assignment job ag)]
+        (let [assignment (create-assignment job ag-id)]
           (alter to-job-queue conj assignment)
             assignment)))))
 
 (defn find-new-job
-  [from-job-queue to-job-queue ag]
+  [from-job-queue to-job-queue ag ag-id]
   (let [primary-match (get-fittest-job-by-skillset (dq/get-seq @from-job-queue) ag :primary_skillset)]
     (if primary-match
-      (assign-job from-job-queue to-job-queue primary-match ag)
+      (assign-job from-job-queue to-job-queue primary-match ag-id)
       (let [secondary-match (get-fittest-job-by-skillset (dq/get-seq @from-job-queue) ag :secondary_skillset)]
         (if secondary-match
-          (assign-job from-job-queue to-job-queue secondary-match ag))))))
+          (assign-job from-job-queue to-job-queue secondary-match ag-id))))))
 
 (defn update-agent-jobs-performed
   [jobs agents ag-id]
@@ -200,22 +206,32 @@
                                   (vec (remove #(= (:agent_id %) (:id to-be-removed)) curr))) ((keyword ag-id) @agents))
         (update-agent-jobs-performed ag-assigned-jobs agents ag-id)))))
 
-(defn agent-not-found
-  [agent-id]
-  (assoc {} :error_msg (str "agent [id=" agent-id  "] not found!")))
+(defn is-job-request-request-body-ok?
+  [request-body]
+  (if request-body
+    (let [_agent-id (:agent_id request-body)]
+      (and (string? _agent-id) (not (empty? (clj-str/trim _agent-id)))))))
 
 (defn request-job
   [request]
-  (let [ag-id (:agent_id (:json-params request))
-        ag ((keyword ag-id) @agents)]
-    (if ag
-      (do
-        (complete-agent-jobs assigned-jobs completed-jobs @agents ag-id)
-        (let [job (find-new-job available-jobs assigned-jobs ag)]
-          (if job
-            ()
-            ())))
-      (http/json-response (agent-not-found (:agent_id (:json-params request)))))))
+  (if (is-job-request-request-body-ok? (:json-params request))
+    (let [ag-id (:agent_id (:json-params request))
+          ag ((keyword ag-id) @agents)]
+      (if (not (nil? ag))
+        (do
+          (complete-agent-jobs assigned-jobs completed-jobs @agents ag-id)
+          (let [job (find-new-job available-jobs assigned-jobs ag ag-id)]
+            (if (not (nil? job))
+              (ring-resp/created (str "http://localhost:8080/request-job/" (:job_id (:json-params request))) (assoc {} :job_id (:job_id job)))
+              (-> (ring-resp/response (json/write-str {:msg "no suitable job found"}))
+                  (ring-resp/content-type "application/json")
+                  (ring-resp/status 404)))))
+        (-> (ring-resp/response (json/write-str {:msg "agent not found"}))
+            (ring-resp/content-type "application/json")
+            (ring-resp/status 404))))
+    (-> (ring-resp/response (json/write-str {:msg "malformed request body"}))
+        (ring-resp/content-type "application/json")
+        (ring-resp/status 403))))
 
 (def common-interceptors [(body-params/body-params) http/json-body])
 
